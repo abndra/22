@@ -3,12 +3,20 @@ import cors from "cors";
 import qrcode from "qrcode";
 import pino from "pino";
 import { mkdir, rm } from "node:fs/promises";
-import {
-  default as makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-} from "@whiskeysockets/baileys";
+import baileysModule from "@whiskeysockets/baileys";
+
+// Baileys 6.x is CommonJS. Under Node ESM its default import is the complete
+// exports object, not makeWASocket itself. Resolve both shapes so upgrades do
+// not bring the container down with "makeWASocket is not a function".
+const baileys = baileysModule?.makeWASocket
+  ? baileysModule
+  : baileysModule?.default || baileysModule;
+const makeWASocket = baileys.makeWASocket || baileys.default;
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys;
+
+if (typeof makeWASocket !== "function") {
+  throw new TypeError("Baileys socket export could not be loaded");
+}
 
 const PORT = process.env.PORT || 3000;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "change-me";
@@ -29,6 +37,7 @@ let lastQr = "";
 let starting = null;
 let reconnectTimer = null;
 let generation = 0;
+let startupError = "";
 
 async function stopSocket() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -44,6 +53,7 @@ async function stopSocket() {
 async function start() {
   if (starting) return starting;
   const myGeneration = ++generation;
+  startupError = "";
   starting = (async () => {
   await mkdir(AUTH_DIR, { recursive: true });
   await stopSocket();
@@ -71,6 +81,7 @@ async function start() {
     if (connection === "open") {
       connected = true;
       lastQr = "";
+      startupError = "";
       console.log("WhatsApp connected ✅");
     }
     if (connection === "close") {
@@ -83,7 +94,16 @@ async function start() {
     }
   });
   })();
-  try { await starting; } finally { starting = null; }
+  try {
+    await starting;
+  } catch (error) {
+    startupError = error?.message || String(error);
+    connected = false;
+    console.error("start failed", error);
+    throw error;
+  } finally {
+    starting = null;
+  }
 }
 start().catch((e) => console.error("start failed", e));
 
@@ -96,7 +116,14 @@ function auth(req, res, next) {
 app.get("/", (_req, res) => res.json({ ok: true, service: "whatsapp-notifier" }));
 
 app.get("/status", auth, (_req, res) => {
-  res.json({ ok: true, connected, status: connected ? "connected" : starting ? "starting" : "waiting", qr: lastQr || undefined, persistentAuth: AUTH_DIR.startsWith("/data/") });
+  res.json({
+    ok: !startupError,
+    connected,
+    status: startupError ? "error" : connected ? "connected" : starting ? "starting" : "waiting",
+    error: startupError || undefined,
+    qr: lastQr || undefined,
+    persistentAuth: AUTH_DIR.startsWith("/data/"),
+  });
 });
 
 app.get("/qr", auth, (_req, res) => res.json({ qr: lastQr || null, connected }));
